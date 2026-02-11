@@ -1,0 +1,912 @@
+---
+title: "Conformal Prediction Bands for Functional Data"
+subtitle: "Fundamentals of Statistical Learning — Homework"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+```
+
+This notebook implements a **conformal prediction** procedure for **functional data**, following the approach described in *"A Conformal Prediction Approach to Explore Functional Data"* (Lei, Rinaldo, Wasserman, 2024), specifically **Section 3 (Projection-based Prediction Bands)**.
+
+**Goal:** Build distribution-free, finite-sample prediction bands for pitch curves extracted from voice recordings of the word "Aloha."
+
+**Pipeline Overview:**
+
+1. **Data Collection & Preprocessing** — Record, extract pitch ($F_0$), normalize to $[0,1]$
+2. **Descriptive Analysis** — Functional mean, variance, covariance surface
+3. **FPCA Projection** — Reduce to low-dimensional PCA scores
+4. **GMM Conformity Score** — Fit a Gaussian Mixture on the scores
+5. **Conformal Calibration** — Find threshold $\lambda$ via inductive conformal prediction
+6. **Band Construction** — Invert ellipsoids to obtain prediction bands in function space
+
+### Libraries
+
+```{r libraries}
+#install.packages(c("mclust", "stats", "graphics", "wrassp"))
+library(wrassp)
+library(mclust)
+```
+
+---
+
+# Data Collection and Loading
+
+## Dataset Description
+
+We built our own functional dataset by recording the word **"Aloha"** spoken by the same person under controlled conditions. Each recording is a single functional observation: a pitch curve $F_0(t)$ extracted from the audio waveform.
+
+We collected three datasets:
+
+- **Training set (D1+D2):** 100 recordings of "Aloha" by Person A, used for model fitting and conformal calibration.
+- **Outlier set:** Recordings of "Aloha" by a different person, expected to fall **outside** the prediction bands.
+- **Test set:** 20 additional recordings by Person A, expected to fall **inside** the bands.
+
+```{r data-paths}
+set.seed(207) 
+system("git clone https://github.com/danpinocontrollino/Roberto-Brambini.git")
+setwd("/content/Roberto-Brambini")
+
+
+# --- USER PATHS ---
+path_train    <- "Aloha/Pollly"
+path_outliers <- "Aloha/Outliers"
+path_test     <- "Aloha/Polly Verdi"
+```
+
+## Data Collection Protocol
+
+### Why "Aloha"?
+
+The word "Aloha" was chosen for several key reasons:
+
+- **Vowel Dominance:** "Aloha" is composed almost entirely of voiced sounds. Unlike words with hidden silence (like the "t" in "Cat"), the vocal folds vibrate throughout almost the entire duration. This gives a continuous pitch curve with very few gaps ($NAs$).
+
+- **"Hump" Geometry:** The "o" sound naturally creates a peak in pitch for most speakers, while the "a" sounds at the beginning and end provide stable baselines. This produces a characteristic single-hump shape that is well-suited for functional analysis.
+
+- **Duration:** Long enough to have distinct phases (onset, peak, offset) but short enough that recording 100 repetitions is feasible without fatigue.
+
+### Recording Protocol — Exchangeability
+
+A critical assumption for conformal prediction is **exchangeability**: the observations $X_1, \dots, X_n, X_{n+1}$ must be exchangeable (i.e., no observation is systematically different from the others). In practice, this means all recordings were collected under the **same conditions**:
+
+- **Same microphone** at a fixed distance (~10–15cm)
+- **Same quiet environment** with minimal echo
+- **Natural speech** — not trying to sound robotic (otherwise bands are artificially narrow)
+- **No time-stretching or warping** of the audio files (this would destroy the raw data)
+- Each recording was exported individually with a small silence padding (~50ms) and named sequentially (`word_01.wav`, `word_02.wav`, etc.)
+
+This ensures that the joint distribution of recordings is invariant under permutations, which is the theoretical foundation for the coverage guarantee of conformal prediction.
+
+## Pitch Extraction
+
+In speech science, "pitch" refers to $F_0$, the **fundamental frequency** of the vocal folds. We extract $F_0$ from the raw `.wav` waveform using the **KSV algorithm** (`ksvF0` from the `wrassp` package), which is a robust autocorrelation-based method suitable for speech signals.
+
+```{r pitch-extraction-example, eval=FALSE}
+# # Get a list of all your wav files
+# files <- list.files(pattern = "\\.wav$")
+
+# # Extract pitch using the KSV algorithm
+# pitch_list <- lapply(files, function(f) {
+#   res <- ksvF0(f, toFile = FALSE)
+#   # F0 track is a matrix, convert to vector
+#   f0_data <- res$F0
+#   if(is.matrix(f0_data)) as.vector(f0_data) else f0_data
+# })
+```
+
+## Normalization to Common Domain
+
+Since recordings have different durations (we did **not** use time-stretching), the resulting pitch vectors have variable lengths. To work with them as functional data, each curve is normalized to a common grid of 100 equispaced points on $[0, 1]$ via linear interpolation. Silence/unvoiced frames ($F_0 = 0$) are removed before interpolation.
+
+### Preprocessing Logic
+
+1. **Extract** the pitch for the whole clip (including silence)
+2. **Threshold** — identify all points where $F_0 > 0$ Hz (voiced)
+3. **Crop** — keep only the segment from the first to the last voiced point
+4. **Normalize** — linearly interpolate that segment to 100 equally-spaced points on $[0,1]$
+
+The result is a matrix $\mathbf{X} \in \mathbb{R}^{n \times 100}$, where each row is a normalized pitch curve.
+
+```{r preprocessing}
+# Normalization: Maps variable-length recordings to a fixed domain t in [0,1]
+normalize_pitch <- function(raw_pitch) {
+  # Filter silence/noise (assume > 0 Hz is voiced)
+  voiced_part <- raw_pitch[raw_pitch > 0]
+  if (length(voiced_part) < 5) return(rep(NA, 100)) 
+  
+  # Linear Interpolation to 100 points
+  approx(x = seq(0, 1, length.out = length(voiced_part)), 
+         y = voiced_part, 
+         xout = seq(0, 1, length.out = 100))$y
+}
+
+# Loader Helper
+load_and_align <- function(path) {
+  if(!dir.exists(path)) return(NULL)
+  files <- list.files(path = path, pattern = "\\.wav$", full.names = TRUE)
+  if(length(files) == 0) return(NULL)
+  
+  raw <- lapply(files, function(f) {
+    res <- ksvF0(f, toFile = FALSE)
+    # ksvF0 returns F0 as a matrix, convert to vector
+    f0 <- res$F0
+    if(is.matrix(f0)) as.vector(f0) else f0
+  })
+  
+  aligned <- lapply(raw, normalize_pitch)
+  mat <- do.call(rbind, aligned)
+  return(na.omit(mat))
+}
+
+# Load Data
+X_matrix   <- load_and_align(path_train)
+X_outliers <- load_and_align(path_outliers)
+X_test     <- load_and_align(path_test)
+
+data_matrix <- X_matrix # Rename to match notebook pattern
+```
+
+## Data Splitting Strategy
+
+We follow the **Inductive Conformal Prediction** framework (Algorithm 1 from the paper), which requires splitting the training data into two disjoint subsets:
+
+| Dataset | Source | Size | Purpose |
+|---------|--------|------|---------|
+| **$D_1$ (Training)** | Person A, "Aloha" | 60% of 100 rec. | Fit PCA + GMM model |
+| **$D_2$ (Calibration)** | Person A, "Aloha" | 40% of 100 rec. | Compute conformity scores → find threshold $\lambda$ |
+| **Test** | Person A, "Aloha" | 20 separate rec. | Validate that bands contain same-speaker curves |
+| **Outliers** | Different person, "Aloha" | 10 rec. | Verify that different-speaker curves fall **outside** the bands |
+
+**Why split?** The Inductive CP approach uses $D_1$ to build the model (FPCA basis + GMM density estimate) and $D_2$ to calibrate the threshold $\lambda$ independently. This avoids overfitting: the conformity scores on $D_2$ are computed on data not used to fit the model, ensuring the finite-sample coverage guarantee:
+
+$$P\left(X_{n+1} \in C_n\right) \geq 1 - \alpha$$
+
+---
+
+# Descriptive Analysis of Functional Data
+
+Before applying conformal prediction, we explore the data using classical functional statistics: the **functional mean**, **functional variance**, and **covariance/correlation surfaces**. These tools reveal the typical shape, variability, and temporal dependency structure of the pitch curves.
+
+## Functional Mean and Variance
+
+```{r data-dimensions}
+# Check data dimensions: n (number of curves) x p (number of time points)
+cat("Data matrix dimensions:", dim(data_matrix), "\n")
+cat("Number of curves (n):", nrow(data_matrix), "\n")
+cat("Number of time points (p):", ncol(data_matrix), "\n")
+```
+
+```{r functional-mean}
+# A. Functional Mean
+# The functional mean mu(t) = (1/n) * sum(X_i(t)) represents the "prototypical" 
+# pitch shape of the word "Aloha". It captures the average trajectory: 
+# an initial rise from the "A", a peak at "lo", and a descent through "ha".
+functional_mean <- colMeans(data_matrix)
+matplot(t(data_matrix), type = "l", lty = 1, col = rgb(0.5, 0.5, 0.5, 0.2),
+        main = "All Pitch Curves with Functional Mean", 
+        ylab = "Pitch (Hz)", xlab = "Normalized Time (%)")
+lines(functional_mean, col = "red", lwd = 3)
+legend("topright", legend = c("Individual curves", "Functional mean"), 
+       col = c("grey", "red"), lty = 1, lwd = c(1, 3))
+```
+
+**Comment:** The plot above shows all individual pitch curves (grey) overlaid with the functional mean (red). The mean curve displays the characteristic hump shape of "Aloha": a rising phase as the vowels are articulated, a peak around the middle, and a falling phase. The spread of grey curves around the mean reveals the natural variability in how the word is pronounced across different repetitions.
+
+```{r functional-variance}
+# B. Functional Variance
+# The pointwise variance Var(t) = (1/(n-1)) * sum((X_i(t) - mu(t))^2) 
+# shows where speakers differ the most. High variance regions indicate 
+# time points where the pitch is less consistent across recordings.
+functional_var <- apply(data_matrix, 2, var)
+plot(functional_var, type = "l", col = "red", lwd = 2,
+     main = "Pointwise Variance of Pitch Curves", 
+     xlab = "Normalized Time (%)", ylab = "Variance (Hz²)")
+```
+
+**Comment:** The functional variance plot highlights regions of high and low variability. Typically, the onset and offset of the word show higher variance because the exact timing of the start/end of voicing varies across recordings. The central portion (around the peak) tends to be more stable, as the "core" of the vowel sound is more consistently produced. This non-constant variance is a sign of **non-stationarity** in the process.
+
+## Covariance and Correlation Surfaces
+
+The **covariance function** $C(s,t) = \text{Cov}(X(s), X(t))$ captures the dependency structure between the pitch at any two time points $s$ and $t$. Its eigendecomposition (Karhunen-Loève) is the theoretical basis for FPCA. The **correlation surface** $\rho(s,t)$ normalizes this to $[-1,1]$.
+
+```{r correlation-matrix}
+cor_matrix <- cor(data_matrix)
+```
+
+```{r correlation-contour, fig.height=7}
+# Filled contour plot of the correlation surface
+# This reveals the dependency structure between pitch at different time points
+time_grid <- seq(-1, 1, length.out = 100)
+t_points <- time_grid * 100
+
+my_colors <- hcl.colors(20, "Viridis")
+
+filled.contour(x = t_points,
+               y = t_points,
+               z = cor_matrix,
+               levels = seq(-1, 1, length.out = 21),
+               color.palette = function(n) my_colors,
+               xlab = "Normalized Time (%)",
+               ylab = "Normalized Time (%)",
+               main = "Functional Correlation Surface (Contour)",
+               key.title = title(main = "Corr", cex.main = 0.8))
+```
+
+```{r correlation-3d, fig.width=12, fig.height=5}
+# 3D perspective views of the correlation surface
+t_points <- time_grid * 100
+
+layout(matrix(c(1, 2), nrow = 1))
+par(mar = c(1, 1, 2, 1))
+
+# View 1: Perspective showing the diagonal ridge
+persp(x = t_points, y = t_points, z = cor_matrix,
+      theta = 35, phi = 30,
+      expand = 0.6, col = "lightblue", shade = 0.4, border = NA,
+      main = "Correlation Surface — Perspective (35°, 30°)",
+      xlab = "t1", ylab = "t2", zlab = "Corr")
+
+# View 2: Rotated view showing ridge width
+persp(x = t_points, y = t_points, z = cor_matrix,
+      theta = 135, phi = 30,
+      expand = 0.6, col = "lightblue", shade = 0.4, border = NA,
+      main = "Correlation Surface — Rotated (135°, 30°)",
+      xlab = "t1", ylab = "t2", zlab = "Corr")
+
+layout(1)
+```
+
+### Interpretation of the Correlation Surface
+
+The correlation surface reveals several important features of the data:
+
+1. **Diagonal Ridge (Local Dependency):** The band of high correlation along the diagonal indicates **temporal persistence** — the pitch at time $t$ is strongly correlated with nearby time points. A wide ridge means the process is smooth and changes slowly; a narrow one would indicate high volatility.
+
+2. **Ridge Decay (Phase Stability):** The rate at which correlation decays away from the diagonal reflects how quickly "synchronization" between curves breaks down. If the ridge narrows toward the edges, it confirms that the onset/offset of the word has more temporal variability — the alignment of curves is looser at the boundaries.
+
+3. **Off-Diagonal Regions (Global Structure):** The corners of the surface (e.g., correlation between $t \approx 10$ and $t \approx 90$) reveal whether the start and end of the word are related. Low correlation in these regions is expected for a single-hump shape: the rising phase is independent of the falling phase.
+
+4. **Non-Stationarity:** If the contour lines are **not parallel** to the diagonal, the process is **non-stationary** — the dependency structure changes along the time axis. This is typical for speech data, where the "rules" of the pitch differ at the onset, peak, and offset of the word.
+
+These observations motivate the use of **FPCA** (Functional PCA), which decomposes the covariance operator to extract the dominant modes of variation.
+
+## Additional Descriptive Plots
+
+```{r boxplots}
+# Boxplots at selected time points to visualize distributional properties
+selected_times <- c(10, 25, 50, 75, 90)
+boxplot(data_matrix[, selected_times], 
+        names = paste0("t=", selected_times, "%"),
+        main = "Pitch Distribution at Selected Time Points",
+        ylab = "Pitch (Hz)", col = "lightblue", border = "darkblue")
+
+# Overlay individual observations as jittered points
+for (i in seq_along(selected_times)) {
+  points(jitter(rep(i, nrow(data_matrix)), amount = 0.15), 
+         data_matrix[, selected_times[i]], 
+         pch = 16, cex = 0.5, col = rgb(0, 0, 0, 0.3))
+}
+```
+
+**Comment:** The boxplots confirm the functional variance analysis: the pitch distribution is wider at the onset and offset of the word, and tighter around the central peak. The distributions appear roughly symmetric at each time point, which is consistent with the Gaussian assumption underlying our GMM model.
+
+---
+
+# Conformal Prediction Bands (Section 3 of the Paper)
+
+We implement **Algorithm 2** from the paper: *Projection-based Prediction Bands*.
+
+### Theoretical Background
+
+**Conformal Prediction** is a **distribution-free**, **finite-sample** method for constructing prediction sets. Unlike classical methods, it makes **no parametric assumptions** about the data distribution — only requiring **exchangeability** of the observations.
+
+**Inductive Conformal Prediction (Algorithm 1):**
+
+Given data $X_1, \dots, X_n$, split into:
+
+- $D_1 = \{X_1, \dots, X_{n_1}\}$ — **training set** (fit the model)
+- $D_2 = \{X_{n_1+1}, \dots, X_n\}$ — **calibration set** (compute conformity scores)
+
+1. Use $D_1$ to build a conformity score function $g: \mathcal{X} \to \mathbb{R}$ (higher = more "normal")
+2. Compute scores $s_i = g(X_i)$ for each $X_i \in D_2$
+3. Set threshold $\lambda = \text{Quantile}_\alpha(\{s_i\}_{i \in D_2})$
+4. Prediction set: $C_n = \{x : g(x) \geq \lambda\}$
+
+**Guarantee:** $P(X_{n+1} \in C_n) \geq 1 - \alpha$ (exact for finite samples, no distributional assumptions).
+
+### Algorithm 2: Projection-Based Bands
+
+The key idea is:
+
+1. **Project** the functional data onto a low-dimensional basis (Functional PCA) to get coefficient vectors $\xi_i \in \mathbb{R}^K$
+2. **Estimate density** of the coefficients using a Gaussian Mixture Model (GMM)
+3. **Calibrate** a density threshold $\lambda$ using conformal prediction
+4. **Invert** the high-density region in coefficient space back to function space to get prediction bands
+
+This approach leverages the Karhunen-Loève decomposition: any curve can be approximated as
+
+$$X(t) \approx \mu(t) + \sum_{j=1}^{K} \xi_j \phi_j(t)$$
+
+where $\mu(t)$ is the mean function, $\phi_j(t)$ are the eigenfunctions (principal components), and $\xi_j$ are the scores (coefficients).
+
+## Data Split and FPCA Projection
+
+```{r fpca}
+# --- Split Data for Inductive Conformal Prediction ---
+# D1 (60%) = Training: fit PCA + GMM
+# D2 (40%) = Calibration: compute conformity scores to find lambda
+n <- nrow(data_matrix)
+n1 <- floor(n * 0.6)
+idx_train <- sample(1:n, n1)
+
+data_train <- data_matrix[idx_train, ]   # D1
+data_calib <- data_matrix[-idx_train, ]   # D2
+
+cat("D1 (Training) size:", nrow(data_train), "\n")
+cat("D2 (Calibration) size:", nrow(data_calib), "\n")
+
+# --- Functional PCA ---
+# Project the infinite-dimensional curves to low-dimensional coefficient vectors
+pca_model <- prcomp(data_train, center = TRUE, scale. = FALSE)
+
+# --- Explained Variance Analysis ---
+eigenvalues <- pca_model$sdev^2
+cum_var_explained <- cumsum(eigenvalues) / sum(eigenvalues)
+
+cat("\nExplained variance by component:\n")
+for (j in 1:min(10, length(eigenvalues))) {
+  cat(sprintf("  PC%d: %.2f%% (cumulative: %.2f%%)\n", 
+              j, eigenvalues[j]/sum(eigenvalues)*100, cum_var_explained[j]*100))
+}
+
+# Choose K = 2 components
+K_components <- 2
+cat(sprintf("\nChosen K = %d components, cumulative variance explained: %.2f%%\n",
+            K_components, cum_var_explained[K_components]*100))
+
+# Extract PCA scores
+coeff_train <- pca_model$x[, 1:K_components]
+coeff_calib <- predict(pca_model, newdata = data_calib)[, 1:K_components]
+```
+
+```{r scree-plot, fig.width=12, fig.height=5}
+# --- Scree Plot: Explained Variance ---
+par(mfrow = c(1, 2))
+
+# Individual explained variance
+barplot(eigenvalues[1:10] / sum(eigenvalues) * 100, 
+        names.arg = paste0("PC", 1:10),
+        main = "Scree Plot: Variance Explained",
+        ylab = "% Variance Explained", col = "steelblue",
+        las = 2, cex.names = 0.8)
+
+# Cumulative explained variance
+plot(1:10, cum_var_explained[1:10] * 100, type = "b", pch = 19, col = "darkred",
+     main = "Cumulative Variance Explained",
+     xlab = "Number of Components", ylab = "Cumulative % Variance",
+     ylim = c(0, 100))
+abline(h = cum_var_explained[K_components] * 100, col = "blue", lty = 2, lwd = 2)
+abline(v = K_components, col = "blue", lty = 2, lwd = 2)
+text(K_components + 0.5, cum_var_explained[K_components] * 100 - 5, 
+     paste0("K=", K_components, ": ", round(cum_var_explained[K_components]*100, 1), "%"),
+     col = "blue", cex = 0.9)
+
+par(mfrow = c(1, 1))
+```
+
+```{r scree-plot-simple}
+# Scree Plot
+var_explained <- pca_model$sdev^2 / sum(pca_model$sdev^2)
+plot(var_explained[1:10], type = "b", main = "Scree Plot", 
+     xlab = "Principal Component", ylab = "Variance Explained", col = "blue", pch = 19)
+grid()
+```
+
+### Why $K = 2$ Components?
+
+We chose $K = 2$ principal components for several reasons:
+
+1. **Visual evidence (Scree Plot):** The scree plot shows a clear "elbow" at $K=2$. The first two components capture the dominant modes of variation, while subsequent components add only marginal improvement.
+
+2. **High explained variance:** The first two PCs explain a large fraction of the total variance (see the cumulative percentage above). This ensures that $X_{\text{proj}}(t) \approx X(t)$ — the projection captures effectively all the meaningful information in the curves.
+
+3. **Interpretability:** With $K=2$, the PCA coefficient space is 2D, which allows direct visualization of the scores, the GMM clusters, and the ellipsoids. This also makes the optimization problem for band construction analytically tractable (closed-form solution).
+
+4. **Practical tradeoff:** Higher $K$ would capture more fine-grained details but would make the GMM estimation harder (curse of dimensionality with limited data) and the ellipsoid inversion more complex.
+
+**Important caveat from the paper:** The conformal guarantee ($1-\alpha$ coverage) applies strictly to the **projected signal** $X_{\text{proj}}(t)$, not the raw data. Therefore, a high explained variance is essential to ensure the bands are meaningful for the original curves. If the explained variance were low, raw curves could "poke out" of the bands even though the guarantee holds for the projected component.
+
+```{r pca-scores, fig.width=12, fig.height=5}
+# Visualize PCA coefficients for D1 (train) and D2 (calibration)
+# This shows how the curves distribute in the projected 2D space
+par(mfrow = c(1, 2), mar = c(5, 4, 3, 1))
+
+plot(coeff_train, main = "PCA Scores — D1 (Training)", 
+     xlab = "PC1", ylab = "PC2", col = "blue", pch = 19, cex = 1.1)
+grid(col = "grey90")
+
+plot(coeff_calib, main = "PCA Scores — D2 (Calibration)", 
+     xlab = "PC1", ylab = "PC2", col = "red", pch = 19, cex = 1.1)
+grid(col = "grey90")
+
+par(mfrow = c(1, 1))
+```
+
+**Comment:** The scatter plots of PCA scores show that $D_1$ and $D_2$ have similar distributions in the projected space, confirming that the random split preserves exchangeability. The scores appear to form a roughly ellipsoidal cloud, which supports the choice of a Gaussian Mixture Model as the conformity score.
+
+## Conformity Score: Gaussian Mixture Model
+
+The **conformity score** is the estimated density of the PCA scores under a Gaussian Mixture Model (GMM). We use `densityMclust` to fit the GMM on $D_1$ scores, which automatically selects the optimal number of components (from 1 to 4) via BIC.
+
+The GMM density is:
+
+$$\hat{f}(\xi) = \sum_{k=1}^{K} \pi_k \cdot \mathcal{N}(\xi ; \hat{\mu}_k, \hat{\Sigma}_k)$$
+
+where $\pi_k$ are the mixing proportions, $\hat{\mu}_k$ are the cluster means, and $\hat{\Sigma}_k$ are the covariance matrices.
+
+```{r gmm, fig.height=7}
+# Fit GMM on training PCA scores (D1)
+# densityMclust selects the best model (number of components + covariance structure) via BIC
+gmm_model <- densityMclust(coeff_train, G = 1:4, plot = FALSE)
+
+# Extract GMM parameters
+means <- gmm_model$parameters$mean        # Cluster means (K x num_clusters matrix)
+sigmas <- gmm_model$parameters$variance$sigma  # Covariance matrices
+props <- gmm_model$parameters$pro          # Mixing proportions
+num_clusters <- gmm_model$G               # Number of clusters selected by BIC
+
+cat("GMM selected", num_clusters, "cluster(s) via BIC\n")
+cat("BIC value:", gmm_model$BIC[which.max(gmm_model$BIC)], "\n")
+cat("Mixing proportions:", round(props, 4), "\n")
+
+# --- Enhanced GMM Visualization ---
+# Cluster assignments based on posterior probabilities
+z_probs <- predict(gmm_model, newdata = coeff_train, what = "z")
+clusters <- apply(z_probs, 1, which.max)
+
+# Color palette
+pal <- c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00")
+cluster_colors <- pal[1:max(num_clusters, 1)]
+
+# Helper: draw covariance ellipse for a given confidence level
+draw_ellipse <- function(mu, sigma, level = 0.95, col, lwd = 2, lty = 1) {
+  chi_val <- qchisq(level, df = 2)
+  eig <- eigen(sigma)
+  angles <- seq(0, 2 * pi, length.out = 100)
+  ellipse <- cbind(cos(angles), sin(angles)) %*% 
+             diag(sqrt(chi_val * eig$values)) %*% t(eig$vectors)
+  ellipse <- sweep(ellipse, 2, mu, "+")
+  lines(ellipse, col = col, lwd = lwd, lty = lty)
+}
+
+# --- Main Plot: GMM Clusters with Confidence Ellipsoids ---
+par(mar = c(5, 5, 4, 2), bg = "white")
+plot(coeff_train[,1], coeff_train[,2],
+     pch = 19, cex = 1.3,
+     col = scales::alpha(cluster_colors[clusters], 0.6),
+     xlab = "PC1 Score", ylab = "PC2 Score",
+     main = paste0("GMM Clustering on D1 Scores (", num_clusters, " component", 
+                   ifelse(num_clusters > 1, "s", ""), ")"),
+     cex.lab = 1.2, cex.main = 1.4)
+grid(col = "gray90", lty = 1)
+
+# Draw ellipsoids for each cluster
+for(k in 1:num_clusters) {
+  mu_k <- means[, k]
+  sigma_k <- if(length(dim(sigmas)) == 3) sigmas[,,k] else sigmas
+  
+  # 95% confidence ellipsoid (solid) — defines the conformal region
+  draw_ellipse(mu_k, sigma_k, level = 0.95, col = cluster_colors[k], lwd = 2.5)
+  # 68% confidence ellipsoid (dashed) — ~1 standard deviation
+  draw_ellipse(mu_k, sigma_k, level = 0.68, col = cluster_colors[k], lwd = 1.5, lty = 2)
+  # Cluster center
+  points(mu_k[1], mu_k[2], pch = 3, cex = 2, lwd = 3, col = cluster_colors[k])
+}
+
+# Print cluster parameters
+for(k in 1:num_clusters) {
+  cat(sprintf("\nCluster %d (weight=%.3f):\n", k, props[k]))
+  cat("  Mean:", round(means[,k], 3), "\n")
+  sigma_k <- if(length(dim(sigmas)) == 3) sigmas[,,k] else sigmas
+  cat("  Covariance:\n")
+  print(round(sigma_k, 3))
+}
+
+legend("topright", 
+       legend = c(paste0("Cluster ", 1:num_clusters), "95% Ellipsoid", "68% Ellipsoid"),
+       col = c(cluster_colors[1:num_clusters], "gray40", "gray40"),
+       pch = c(rep(19, num_clusters), NA, NA),
+       lty = c(rep(NA, num_clusters), 1, 2),
+       lwd = c(rep(NA, num_clusters), 2.5, 1.5),
+       pt.cex = 1.2, cex = 0.9, bg = "white")
+```
+
+**Comment on GMM Results:**
+
+The GMM was fitted on the $D_1$ training scores using BIC model selection. The number of components selected reflects the intrinsic clustering structure of the PCA scores:
+
+- **1 component:** The pitch curves of "Aloha" form a single coherent cluster — all repetitions are variations of the same underlying shape.
+- **2+ components:** There may be distinct "modes" of pronunciation (e.g., rising vs. flat intonation patterns).
+
+The **ellipsoids** shown in the plot represent the covariance structure of each Gaussian component. The solid ellipse (95%) will be used later to define the prediction region $T_{n,k}$, after adjusting the radius $r_k$ via conformal calibration. The dashed ellipse (68%) corresponds roughly to a 1-$\sigma$ region and helps visualize the cluster concentration.
+
+## Conformal Calibration — Finding the Threshold $\lambda$
+
+Using the calibration set $D_2$, we compute the GMM density at each calibration point and take the $\alpha$-quantile as the threshold. This is the core of the **inductive conformal prediction** procedure.
+
+```{r calibration}
+calib_densities <- predict(gmm_model, coeff_calib, what = "dens")
+
+# 2. Find the Threshold (Lambda)
+alpha <- 0.05
+lambda <- quantile(calib_densities, probs = alpha, type = 1, na.rm = TRUE)
+
+print(paste("Threshold Lambda:", lambda))
+```
+
+## Band Construction — From Coefficient Space to Function Space
+
+### Step 1: The Guarantee in Coefficient Space
+
+The conformal calibration defines a **High Density Region** in the PCA score space:
+
+$$\widehat{C}_{1-\alpha} = \left\{ \xi \in \mathbb{R}^K : \widehat{f}(\xi) \ge \lambda \right\}$$
+
+By the conformal prediction property, for a new observation $\xi_{n+1}$:
+
+$$P\left( \xi_{n+1} \in \widehat{C}_{1-\alpha} \right) \ge 1 - \alpha$$
+
+This means: with probability at least $1-\alpha$, the PCA scores of a new curve fall inside this "blob" in coefficient space.
+
+### Step 2: From Coefficient "Blob" to Function "Tube"
+
+The relationship between the projected curve $X(t)$ and its coefficients $\xi$ is **linear**:
+
+$$X(t) = \mu(t) + \phi(t)^T \xi$$
+
+where:
+
+- $\mu(t)$ is the mean curve (scalar at time $t$)
+- $\phi(t) \in \mathbb{R}^K$ is the vector of eigenfunctions evaluated at time $t$
+- $\xi \in \mathbb{R}^K$ is the coefficient vector
+
+If $\xi$ is constrained to lie inside $\widehat{C}_{1-\alpha}$, then the curve value $X(t)$ must lie within the range generated by all valid $\xi$. This transforms a **region in coefficient space** into a **band in function space**.
+
+```{r setup-bands}
+# --- Setup ---
+
+# 1. Define Time Axis
+time_points <- 1:ncol(data_train)
+
+# 2. Extract PCA Basis (The "Skeleton")
+phi <- pca_model$rotation[, 1:K_components, drop = FALSE]
+mean_curve <- pca_model$center
+
+# 3. Setup Storage for the Bands
+# Since we have a Union of Bands, we cannot store just one "upper" and "lower".
+# We will store the bounds for EVERY valid cluster in a list.
+cluster_bands <- list()
+valid_clusters <- integer()
+
+
+print("Parameters extracted.")
+```
+
+### Step 3: Constraint Inversion — Ellipsoid Approximation
+
+Since $\hat{f}$ is a GMM, the set $\widehat{C}_{1-\alpha}$ is a **union of ellipsoids**. Finding this set directly is complex, so we use a **superset** that is easier to compute.
+
+We consider each cluster $k$ separately and adjust the threshold to $\frac{\lambda}{K}$ (where $K$ is the number of GMM components). This gives a relaxed condition per cluster:
+
+$$\pi_k \cdot \mathcal{N}(\xi; \hat{\mu}_k, \hat{\Sigma}_k) \geq \frac{\lambda}{K}$$
+
+Expanding the Gaussian and taking the log:
+
+$$(\xi - \hat{\mu}_k)^T \hat{\Sigma}_k^{-1} (\xi - \hat{\mu}_k) \leq r_k^2$$
+
+where $r_k^2 = -2 \ln\left( \frac{\lambda}{\pi_k \cdot C_k \cdot K} \right)$ and $C_k = (2\pi)^{-K/2} |\hat{\Sigma}_k|^{-1/2}$.
+
+The prediction set is then:
+
+$$\widehat{C}_{1-\alpha} \subseteq \bigcup_{k=1}^{K} T_{n,k}$$
+
+Each individual set $T_{n,k}$ is an **ellipsoid** defined by the Mahalanobis distance:
+
+$$T_{n,k} = \left\{ \xi \in \mathbb{R}^K : (\xi - \hat{\mu}_k)^T \hat{\Sigma}_k^{-1} (\xi - \hat{\mu}_k) \le r_k^2 \right\}$$
+
+The radius $r_k$ is determined by the conformal threshold $\lambda$ and the GMM parameters. Only clusters with $r_k^2 > 0$ (i.e., $\frac{\lambda}{\pi_k \cdot C_k \cdot K} < 1$) produce valid ellipsoids.
+
+```{r radii}
+# --- Calculate Ellipsoid Radii r_k for Each Cluster ---
+cluster_radii  <- numeric(num_clusters)
+
+for (k in 1:num_clusters) {
+  Sigma_k <- sigmas[, , k]
+  pi_k    <- props[k]
+
+  # Normalizing constant of the Gaussian
+  if (K_components == 1) {
+    det_Sigma <- Sigma_k[1]
+    C_k <- (2 * pi)^(-0.5) * det_Sigma^(-0.5)
+  } else {
+    det_Sigma <- det(Sigma_k)
+    C_k <- (2 * pi)^(-K_components/2) * det_Sigma^(-0.5)
+  }
+
+  # Relaxed threshold: lambda/K (superset approximation)
+  relaxed_threshold <- lambda / num_clusters
+  term_inside_log <- relaxed_threshold / (pi_k * C_k)
+
+  if (term_inside_log < 1) {
+    valid_clusters <- c(valid_clusters, k)
+    r_squared <- -2 * log(term_inside_log)
+    cluster_radii[k] <- sqrt(r_squared)
+    cat(sprintf("Cluster %d: r² = %.4f, r = %.4f (VALID ellipsoid)\n", k, r_squared, cluster_radii[k]))
+  } else {
+    cluster_radii[k] <- 0
+    cat(sprintf("Cluster %d: term_inside_log = %.4f >= 1, NO valid ellipsoid\n", k, term_inside_log))
+  }
+}
+
+cat("\nValid clusters:", valid_clusters, "\n")
+cat("Number of valid ellipsoids:", length(valid_clusters), "\n")
+```
+
+### Closed-Form Band Solution
+
+We have a closed form solution for linear optimization problem constrained with ellipsoid
+
+**The Upper Bound** $U_k(t)$:
+
+$$U_k(t) = \hat{\mu}(t) + \sup_{\xi \in T_{n,k}} (\phi(t)^T \xi)$$
+
+$$U_k(t) = \hat{\mu}(t) + \phi(t)^T \hat{\mu}_k + r_k \sqrt{\phi(t)^T \hat{\Sigma}_k \phi(t)}$$
+
+**The Lower Bound** $L_k(t)$:
+
+$$L_k(t) = \hat{\mu}(t) + \inf_{\xi \in T_{n,k}} (\phi(t)^T \xi)$$
+
+$$L_k(t) = \hat{\mu}(t) + \phi(t)^T \hat{\mu}_k - r_k \sqrt{\phi(t)^T \hat{\Sigma}_k \phi(t)}$$
+
+```{r bands}
+# --- Project Bands over Time ---
+
+for (k in valid_clusters) {
+
+  # 1. Setup temporary vectors for this specific cluster band
+  k_upper <- numeric(length(time_points))
+  k_lower <- numeric(length(time_points))
+
+  # 2. Loop through Time
+  for (t in 1:length(time_points)) {
+
+    if (K_components == 1) phi_t <- phi[t] else phi_t <- phi[t, ]
+
+    # A. Center Position at time t
+    # (Global Mean + Cluster Mean projected)
+    center_val <- mean_curve[t] + sum(means[, k] * phi_t)
+
+    # B. Spread (Width) at time t
+    # Formula: Radius * sqrt( phi^T * Sigma * phi )
+    Sigma_k <- sigmas[, , k]
+
+    if (K_components == 1) {
+       var_proj <- phi_t^2 * Sigma_k[1]
+    } else {
+       var_proj <- t(phi_t) %*% Sigma_k %*% phi_t
+    }
+
+    spread <- cluster_radii[k] * sqrt(var_proj)
+
+    # Store
+    k_upper[t] <- center_val + spread
+    k_lower[t] <- center_val - spread
+  }
+
+  # 3. Save this band to our list
+  cluster_bands[[paste0("Cluster_", k)]] <- list(upper = k_upper, lower = k_lower)
+}
+
+print("Bands calculated !")
+```
+
+### Final Union — Prediction Band
+
+The final prediction set at each time point $t$ is the **union** of the intervals from all valid clusters:
+
+$$C_n(t) = \bigcup_{k \in \text{Valid}} [L_k(t), \, U_k(t)]$$
+
+This ensures that the band inherits the conformal guarantee from coefficient space.
+
+```{r final-plot, fig.height=7}
+# --- Final Visualization: Conformal Bands vs All Data ---
+full_range <- range(c(data_train, X_outliers, X_test), na.rm=TRUE)
+
+par(mar = c(5, 5, 4, 2))
+
+# 1. Training data (grey background)
+matplot(t(data_train[1:min(50, nrow(data_train)), ]), type = "l",
+        col = rgb(0.5, 0, 0.5, 0.15), lty = 1, ylim = full_range,
+        main = expression(paste("Conformal Prediction Bands (", alpha, " = 0.05)")), 
+        ylab = "Pitch (Hz)", xlab = "Normalized Time (%)",
+        cex.lab = 1.2, cex.main = 1.4)
+
+# 2. Mean curve
+lines(mean_curve, col = "black", lwd = 2.5)
+
+# 3. Conformal Bands (red shaded regions)
+for (k_name in names(cluster_bands)) {
+  band <- cluster_bands[[k_name]]
+  poly_x <- c(1:100, 100:1)
+  poly_y <- c(band$upper, rev(band$lower))
+  
+  polygon(poly_x, poly_y, col = rgb(1, 0, 0, 0.15), border = NA)
+  lines(1:100, band$upper, col = "red", lty = 2, lwd = 2)
+  lines(1:100, band$lower, col = "red", lty = 2, lwd = 2)
+}
+
+# 4. Outliers (blue) — should fall OUTSIDE the bands
+if (!is.null(X_outliers)) {
+  matlines(t(X_outliers), col = "blue", lwd = 2, lty = 1)
+}
+
+# 5. Test data (green) — should fall INSIDE the bands
+if (!is.null(X_test)) {
+  matlines(t(X_test), col = "darkgreen", lwd = 1, lty = 1)
+}
+
+# 6. Legend
+legend("topright", 
+       legend = c("Training (D1)", "Mean curve", 
+                  paste0((1-alpha)*100, "% Band"), 
+                  "Outliers (other person)", "Test (same person)"),
+       col = c("purple", "black", "red", "blue", "darkgreen"), 
+       lty = c(1, 1, 2, 1, 1), 
+       lwd = c(1, 2.5, 2, 2, 1),
+       bg = "white", cex = 0.85)
+```
+
+---
+
+# Interpretation and Scope of the Guarantee
+
+### The Projection Guarantee
+
+It is crucial to understand **what** is being bounded by our Conformal Prediction bands.
+
+**Decomposition.** Any raw curve $X(t)$ can be decomposed as:
+
+$$X(t) = \underbrace{X_{\text{proj}}(t)}_{\text{Signal (PCA reconstruction)}} + \underbrace{\epsilon(t)}_{\text{Residuals (unexplained variation)}}$$
+
+**The guarantee.** Our method builds the bands $C(t)$ entirely in the **PCA score space**. Therefore, the statistical guarantee ($1-\alpha$ coverage) applies **strictly to the projected signal**:
+
+$$P\left( X_{\text{proj}}(t) \in C(t), \; \forall t \right) \ge 1 - \alpha$$
+
+**Why this matters.** The choice of $K$ determines the gap between the raw data and the guaranteed projection:
+
+| Scenario | Implication |
+|----------|-------------|
+| **High variance explained** ($\geq 95\%$) | $X_{\text{proj}}(t) \approx X(t)$, residuals are negligible → bands effectively cover the raw data |
+| **Low variance explained** | $X_{\text{proj}}(t)$ is a simplified smoothing → raw curves may exceed the bands even though the guarantee holds for the underlying shape |
+
+**Our case:** With $K=2$ components explaining a large portion of the variance (see Section 3.1), the projection captures the essential shape of the pitch curves, making the bands meaningful for the raw data as well.
+
+### Results Discussion
+
+The plot above should show:
+
+- **Test curves (green, same person):** mostly contained within the red bands, confirming the coverage guarantee
+- **Outlier curves (blue, different person):** falling outside the bands, demonstrating that the bands are **discriminative** — they capture the specific pitch signature of the training speaker
+
+This validates both the correctness of the implementation and the practical utility of the conformal prediction approach for functional data.
+
+---
+
+# Testing the Conformal Prediction Bands
+
+### Coverage Check
+
+To verify the conformal guarantee, we compute the empirical coverage on both the test set (same person) and the outlier set (different person).
+
+**Expected behavior:**
+
+- **Test (same person):** coverage $\geq 1 - \alpha = 95\%$ of curves should be fully contained
+- **Outliers (different person):** most curves should **not** be fully contained
+
+```{r coverage}
+# --- Coverage Analysis ---
+# Check if each curve is fully contained within the prediction band
+check_coverage <- function(curves, bands) {
+  if (is.null(curves) || nrow(curves) == 0) return(NULL)
+  
+  # Compute global upper/lower envelope (union of all cluster bands)
+  global_upper <- rep(-Inf, 100)
+  global_lower <- rep(Inf, 100)
+  for (b in bands) {
+    global_upper <- pmax(global_upper, b$upper)
+    global_lower <- pmin(global_lower, b$lower)
+  }
+  
+  # For each curve, check if it's fully inside the band
+  contained <- sapply(1:nrow(curves), function(i) {
+    all(curves[i,] >= global_lower & curves[i,] <= global_upper)
+  })
+  
+  return(contained)
+}
+
+# Test set coverage
+test_coverage <- check_coverage(X_test, cluster_bands)
+if (!is.null(test_coverage)) {
+  cat(sprintf("Test set (same person): %d/%d curves contained (%.1f%%)\n",
+              sum(test_coverage), length(test_coverage), 
+              mean(test_coverage) * 100))
+}
+
+# Outlier set coverage
+outlier_coverage <- check_coverage(X_outliers, cluster_bands)
+if (!is.null(outlier_coverage)) {
+  cat(sprintf("Outlier set (different person): %d/%d curves contained (%.1f%%)\n",
+              sum(outlier_coverage), length(outlier_coverage), 
+              mean(outlier_coverage) * 100))
+}
+```
+
+```{r comparison-plots, fig.width=12, fig.height=5}
+# --- Side-by-side comparison plots ---
+par(mfrow = c(1, 2), mar = c(5, 4, 3, 1))
+
+# Compute global band envelope
+global_upper <- rep(-Inf, 100)
+global_lower <- rep(Inf, 100)
+for (b in cluster_bands) {
+  global_upper <- pmax(global_upper, b$upper)
+  global_lower <- pmin(global_lower, b$lower)
+}
+
+# PLOT 1: Same person (Test) vs Bands
+plot_range <- range(c(global_upper, global_lower, X_test, X_outliers), na.rm=TRUE)
+plot(1:100, global_upper, type = "n", ylim = plot_range,
+     main = "Test (Same Person) vs Bands",
+     xlab = "Time (%)", ylab = "Pitch (Hz)")
+polygon(c(1:100, 100:1), c(global_upper, rev(global_lower)), 
+        col = rgb(1, 0, 0, 0.15), border = NA)
+lines(global_upper, col = "red", lty = 2, lwd = 2)
+lines(global_lower, col = "red", lty = 2, lwd = 2)
+if (!is.null(X_test)) matlines(t(X_test), col = "darkgreen", lwd = 1, lty = 1)
+lines(mean_curve, col = "black", lwd = 2)
+
+# PLOT 2: Other person (Outliers) vs Bands
+plot(1:100, global_upper, type = "n", ylim = plot_range,
+     main = "Outliers (Other Person) vs Bands",
+     xlab = "Time (%)", ylab = "Pitch (Hz)")
+polygon(c(1:100, 100:1), c(global_upper, rev(global_lower)), 
+        col = rgb(1, 0, 0, 0.15), border = NA)
+lines(global_upper, col = "red", lty = 2, lwd = 2)
+lines(global_lower, col = "red", lty = 2, lwd = 2)
+if (!is.null(X_outliers)) matlines(t(X_outliers), col = "blue", lwd = 2, lty = 1)
+lines(mean_curve, col = "black", lwd = 2)
+
+par(mfrow = c(1, 1))
+```
+
+### Conclusions
+
+The conformal prediction bands successfully:
+
+1. **Contain the test curves** from the same speaker, validating the theoretical coverage guarantee $P(X_{n+1} \in C_n) \geq 1 - \alpha$.
+
+2. **Exclude the outlier curves** from a different speaker, demonstrating that the bands capture the **individual pitch signature** rather than generic speech patterns.
+
+3. **Are meaningful for raw data** thanks to the high explained variance of the first $K=2$ principal components. As discussed in Section 4.1, the conformal guarantee technically applies to the projected signal $X_{\text{proj}}(t)$, but since the projection captures nearly all the variance, the bands are effective for the original curves as well.
+
+**Remark on the projection safety:** The paper emphasizes that the guarantee is only in the **projected space**. In our implementation, the high cumulative variance explained by $K=2$ components ensures that $X_{\text{proj}}(t) \approx X(t)$, making the gap between the formal guarantee and the practical coverage negligible. If one needed to be more conservative, increasing $K$ would further tighten this gap at the cost of increased computational complexity and potentially wider bands (due to higher-dimensional ellipsoids).
